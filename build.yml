@@ -1,0 +1,510 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.0
+      - name: Create project files
+        run: |
+          cat > build.gradle <<'PVPEOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+          base { archivesName = project.archives_base_name }
+
+          repositories { }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+
+          tasks.withType(JavaCompile).configureEach { options.release = 21 }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          PVPEOF
+          cat > gradle.properties <<'PVPEOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          minecraft_version=1.21.11
+          loader_version=0.19.5
+          fabric_version=0.141.3+1.21.11
+          mod_version=1.0.0
+          maven_group=dev.pvpbot
+          archives_base_name=pvpbot
+          PVPEOF
+          cat > settings.gradle <<'PVPEOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'pvpbot'
+          PVPEOF
+          mkdir -p src/main/java/dev/pvpbot
+          cat > src/main/java/dev/pvpbot/AutoAnchor.java <<'PVPEOF'
+          package dev.pvpbot;
+
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.client.player.LocalPlayer;
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.block.Blocks;
+          import net.minecraft.world.level.block.RespawnAnchorBlock;
+          import net.minecraft.world.phys.AABB;
+          import net.minecraft.world.phys.Vec3;
+
+          /** Only works in the Overworld/End: in the Nether anchors do not explode. */
+          public final class AutoAnchor {
+              private AutoAnchor() {}
+
+              public static boolean tick(Minecraft mc, Player target) {
+                  LocalPlayer me = mc.player;
+                  ClientLevel level = mc.level;
+                  if (level.dimension() == Level.NETHER) return false;
+
+                  BlockPos tp = target.blockPosition();
+
+                  // 1) existing anchor near the target: charge it, then pop it
+                  BlockPos anchor = null;
+                  double bestScore = -1e9;
+                  for (int dx = -4; dx <= 4; dx++) for (int dz = -4; dz <= 4; dz++) for (int dy = -3; dy <= 3; dy++) {
+                      BlockPos p = tp.offset(dx, dy, dz);
+                      if (!level.getBlockState(p).is(Blocks.RESPAWN_ANCHOR)) continue;
+                      if (!Util.inReach(me, p, Cfg.placeRange)) continue;
+                      Vec3 c = Vec3.atCenterOf(p);
+                      double t = Dmg.estimate(level, c, target, 5f);
+                      double s = Dmg.estimate(level, c, me, 5f);
+                      if (t < Cfg.minDamage || s > Cfg.maxSelf || s >= me.getHealth() - 1) continue;
+                      if (t - s > bestScore) { bestScore = t - s; anchor = p; }
+                  }
+                  if (anchor != null) {
+                      int charge = level.getBlockState(anchor).getValue(RespawnAnchorBlock.CHARGE);
+                      if (charge == 0) {
+                          int g = Util.findHotbar(me, Items.GLOWSTONE);
+                          if (g < 0) return false;
+                          Util.select(me, g);
+                          Util.useOn(mc, anchor, Direction.UP);
+                      } else {
+                          int other = Util.findHotbarNot(me, Items.GLOWSTONE);
+                          if (other < 0) return false;
+                          Util.select(me, other);
+                          Util.useOn(mc, anchor, Direction.UP);   // explodes
+                      }
+                      return true;
+                  }
+
+                  // 2) place a new anchor on solid ground next to the target
+                  int slot = Util.findHotbar(me, Items.RESPAWN_ANCHOR);
+                  if (slot < 0) return false;
+                  BlockPos bestPos = null;
+                  bestScore = -1e9;
+                  for (int dx = -2; dx <= 2; dx++) for (int dz = -2; dz <= 2; dz++) for (int dy = -1; dy <= 2; dy++) {
+                      BlockPos p = tp.offset(dx, dy, dz);
+                      if (!level.isEmptyBlock(p)) continue;
+                      BlockPos below = p.below();
+                      if (level.isEmptyBlock(below)) continue;
+                      if (!Util.inReach(me, below, Cfg.placeRange)) continue;
+                      if (!level.getEntitiesOfClass(Entity.class, new AABB(p)).isEmpty()) continue;
+                      Vec3 c = Vec3.atCenterOf(p);
+                      double t = Dmg.estimate(level, c, target, 5f);
+                      double s = Dmg.estimate(level, c, me, 5f);
+                      if (t < Cfg.minDamage || s > Cfg.maxSelf || s >= me.getHealth() - 1) continue;
+                      if (t - s > bestScore) { bestScore = t - s; bestPos = below; }
+                  }
+                  if (bestPos == null) return false;
+                  Util.select(me, slot);
+                  Util.useOn(mc, bestPos, Direction.UP);
+                  return true;
+              }
+          }
+          PVPEOF
+          mkdir -p src/main/java/dev/pvpbot
+          cat > src/main/java/dev/pvpbot/AutoCrystal.java <<'PVPEOF'
+          package dev.pvpbot;
+
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.client.player.LocalPlayer;
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.InteractionHand;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.level.block.Blocks;
+          import net.minecraft.world.phys.AABB;
+          import net.minecraft.world.phys.Vec3;
+
+          public final class AutoCrystal {
+              private AutoCrystal() {}
+
+              /** @return true if an action was taken this tick */
+              public static boolean tick(Minecraft mc, Player target) {
+                  LocalPlayer me = mc.player;
+                  ClientLevel level = mc.level;
+
+                  // 1) break the best crystal in reach
+                  EndCrystal bestC = null;
+                  double bestScore = -1e9;
+                  AABB around = me.getBoundingBox().inflate(Cfg.breakRange + 1);
+                  for (EndCrystal c : level.getEntitiesOfClass(EndCrystal.class, around)) {
+                      if (me.getEyePosition().distanceTo(c.position()) > Cfg.breakRange) continue;
+                      Vec3 cc = c.position().add(0, 0.5, 0);
+                      double t = Dmg.estimate(level, cc, target, 6f);
+                      double s = Dmg.estimate(level, cc, me, 6f);
+                      if (t < Cfg.minDamage || s > Cfg.maxSelf || s >= me.getHealth() - 1) continue;
+                      double score = t - s;
+                      if (score > bestScore) { bestScore = score; bestC = c; }
+                  }
+                  if (bestC != null) {
+                      mc.gameMode.attack(me, bestC);
+                      me.swing(InteractionHand.MAIN_HAND);
+                      return true;
+                  }
+
+                  // 2) place a new crystal
+                  int slot = Util.findHotbar(me, Items.END_CRYSTAL);
+                  if (slot < 0) return false;
+
+                  BlockPos tp = target.blockPosition();
+                  BlockPos bestPos = null;
+                  bestScore = -1e9;
+                  for (int dx = -3; dx <= 3; dx++) for (int dz = -3; dz <= 3; dz++) for (int dy = -2; dy <= 1; dy++) {
+                      BlockPos base = tp.offset(dx, dy, dz);
+                      var st = level.getBlockState(base);
+                      if (!st.is(Blocks.OBSIDIAN) && !st.is(Blocks.BEDROCK)) continue;
+                      BlockPos a1 = base.above(), a2 = base.above(2);
+                      if (!level.isEmptyBlock(a1) || !level.isEmptyBlock(a2)) continue;
+                      if (!Util.inReach(me, base, Cfg.placeRange)) continue;
+                      if (!level.getEntitiesOfClass(Entity.class, new AABB(a1).expandTowards(0, 1, 0)).isEmpty()) continue;
+                      Vec3 cc = new Vec3(base.getX() + 0.5, base.getY() + 1.0, base.getZ() + 0.5).add(0, 0.5, 0);
+                      double t = Dmg.estimate(level, cc, target, 6f);
+                      double s = Dmg.estimate(level, cc, me, 6f);
+                      if (t < Cfg.minDamage || s > Cfg.maxSelf || s >= me.getHealth() - 1) continue;
+                      double score = t - s;
+                      if (score > bestScore) { bestScore = score; bestPos = base; }
+                  }
+                  if (bestPos == null) return false;
+                  Util.select(me, slot);
+                  Util.useOn(mc, bestPos, Direction.UP);
+                  return true;
+              }
+          }
+          PVPEOF
+          mkdir -p src/main/java/dev/pvpbot
+          cat > src/main/java/dev/pvpbot/Cfg.java <<'PVPEOF'
+          package dev.pvpbot;
+
+          /** Runtime settings (change with /pvpbot ...). */
+          public final class Cfg {
+              public static boolean crystal = false;
+              public static boolean anchor = false;
+              public static int delay = 2;               // ticks between actions
+              public static double targetRange = 8.0;    // how far a target may be
+              public static double placeRange = 4.5;     // block placing reach
+              public static double breakRange = 4.0;     // crystal hit reach
+              public static double minDamage = 6.0;      // min estimated damage to target (hp, 2 = 1 heart)
+              public static double maxSelf = 6.0;        // max estimated damage to yourself
+              private Cfg() {}
+          }
+          PVPEOF
+          mkdir -p src/main/java/dev/pvpbot
+          cat > src/main/java/dev/pvpbot/Dmg.java <<'PVPEOF'
+          package dev.pvpbot;
+
+          import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.level.ClipContext;
+          import net.minecraft.world.phys.AABB;
+          import net.minecraft.world.phys.HitResult;
+          import net.minecraft.world.phys.Vec3;
+
+          /** Rough explosion damage estimate (ignores armor/enchants, so it is on the safe side). */
+          public final class Dmg {
+              private Dmg() {}
+
+              public static double estimate(ClientLevel level, Vec3 center, Entity e, float power) {
+                  double radius = power * 2.0;
+                  Vec3 ep = e.position();
+                  double dist = Math.sqrt(center.distanceToSqr(ep)) ;
+                  if (dist > radius) return 0;
+                  double exposure = exposure(level, center, e);
+                  double impact = (1.0 - dist / radius) * exposure;
+                  return (impact * impact + impact) / 2.0 * 7.0 * radius + 1.0;
+              }
+
+              private static double exposure(ClientLevel level, Vec3 from, Entity e) {
+                  AABB b = e.getBoundingBox();
+                  double cx = (b.minX + b.maxX) / 2, cz = (b.minZ + b.maxZ) / 2;
+                  double[][] pts = {
+                      {cx, b.minY + 0.1, cz}, {cx, (b.minY + b.maxY) / 2, cz}, {cx, b.maxY - 0.1, cz},
+                      {b.minX, (b.minY + b.maxY) / 2, b.minZ}, {b.maxX, (b.minY + b.maxY) / 2, b.minZ},
+                      {b.minX, (b.minY + b.maxY) / 2, b.maxZ}, {b.maxX, (b.minY + b.maxY) / 2, b.maxZ}
+                  };
+                  int clear = 0;
+                  for (double[] p : pts) {
+                      Vec3 to = new Vec3(p[0], p[1], p[2]);
+                      var hit = level.clip(new ClipContext(from, to, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, e));
+                      if (hit.getType() == HitResult.Type.MISS) clear++;
+                  }
+                  return clear / (double) pts.length;
+              }
+          }
+          PVPEOF
+          mkdir -p src/main/java/dev/pvpbot
+          cat > src/main/java/dev/pvpbot/PvpBotClient.java <<'PVPEOF'
+          package dev.pvpbot;
+
+          import com.mojang.brigadier.arguments.DoubleArgumentType;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.world.entity.player.Player;
+
+          import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+          import com.mojang.brigadier.context.CommandContext;
+
+          public class PvpBotClient implements ClientModInitializer {
+              private int cooldown = 0;
+              private static volatile boolean openGui = false;
+
+              @Override
+              public void onInitializeClient() {
+                  ClientTickEvents.END_CLIENT_TICK.register(this::tick);
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+                      LiteralArgumentBuilder<FabricClientCommandSource> root = ClientCommandManager.literal("pvpbot");
+                      root.then(ClientCommandManager.literal("crystal").executes(c -> {
+                          Cfg.crystal = !Cfg.crystal; return say(c, "Auto crystal: " + (Cfg.crystal ? "ON" : "OFF")); }));
+                      root.then(ClientCommandManager.literal("anchor").executes(c -> {
+                          Cfg.anchor = !Cfg.anchor; return say(c, "Auto anchor: " + (Cfg.anchor ? "ON" : "OFF")); }));
+                      root.then(ClientCommandManager.literal("gui").executes(c -> { openGui = true; return 1; }));
+                      root.then(ClientCommandManager.literal("off").executes(c -> {
+                          Cfg.crystal = false; Cfg.anchor = false; return say(c, "All OFF"); }));
+                      root.then(ClientCommandManager.literal("delay").then(ClientCommandManager.argument("ticks", IntegerArgumentType.integer(1, 20))
+                          .executes(c -> { Cfg.delay = IntegerArgumentType.getInteger(c, "ticks"); return say(c, "delay = " + Cfg.delay); })));
+                      root.then(ClientCommandManager.literal("mindamage").then(ClientCommandManager.argument("hp", DoubleArgumentType.doubleArg(0, 40))
+                          .executes(c -> { Cfg.minDamage = DoubleArgumentType.getDouble(c, "hp"); return say(c, "minDamage = " + Cfg.minDamage); })));
+                      root.then(ClientCommandManager.literal("maxself").then(ClientCommandManager.argument("hp", DoubleArgumentType.doubleArg(0, 40))
+                          .executes(c -> { Cfg.maxSelf = DoubleArgumentType.getDouble(c, "hp"); return say(c, "maxSelf = " + Cfg.maxSelf); })));
+                      root.then(ClientCommandManager.literal("range").then(ClientCommandManager.argument("blocks", DoubleArgumentType.doubleArg(2, 12))
+                          .executes(c -> { Cfg.targetRange = DoubleArgumentType.getDouble(c, "blocks"); return say(c, "targetRange = " + Cfg.targetRange); })));
+                      root.executes(c -> say(c, "crystal=" + Cfg.crystal + " anchor=" + Cfg.anchor + " delay=" + Cfg.delay
+                          + " minDamage=" + Cfg.minDamage + " maxSelf=" + Cfg.maxSelf + " range=" + Cfg.targetRange
+                          + " | /pvpbot gui|crystal|anchor|off|delay N|mindamage N|maxself N|range N"));
+                      dispatcher.register(root);
+                  });
+              }
+
+              private static int say(CommandContext<FabricClientCommandSource> c, String msg) {
+                  c.getSource().sendFeedback(Component.literal("[PvPBot] " + msg));
+                  return 1;
+              }
+
+              private void tick(Minecraft mc) {
+                  if (openGui) { openGui = false; mc.setScreen(new PvpScreen()); return; }
+                  if (!Cfg.crystal && !Cfg.anchor) return;
+                  if (mc.player == null || mc.level == null || mc.gameMode == null || mc.screen != null) return;
+                  if (!mc.player.isAlive()) return;
+                  if (cooldown > 0) { cooldown--; return; }
+                  Player target = Util.nearestTarget(mc, Cfg.targetRange);
+                  if (target == null) return;
+                  boolean acted = false;
+                  try {
+                      if (Cfg.crystal) acted = AutoCrystal.tick(mc, target);
+                      if (!acted && Cfg.anchor) acted = AutoAnchor.tick(mc, target);
+                  } catch (Throwable ignored) {
+                  }
+                  if (acted) cooldown = Cfg.delay - 1;
+              }
+          }
+          PVPEOF
+          mkdir -p src/main/java/dev/pvpbot
+          cat > src/main/java/dev/pvpbot/PvpScreen.java <<'PVPEOF'
+          package dev.pvpbot;
+
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /** Touch-friendly settings screen: big buttons, +/- instead of sliders. */
+          public class PvpScreen extends Screen {
+              private Button bCrystal, bAnchor, bDelay, bMin, bMax, bRange;
+
+              public PvpScreen() { super(Component.literal("PvP Bot")); }
+
+              @Override
+              protected void init() {
+                  int w = 200, h = 24, x = this.width / 2 - w / 2, y = this.height / 2 - 100, gap = 28;
+
+                  bCrystal = addRenderableWidget(Button.builder(Component.empty(), b -> { Cfg.crystal = !Cfg.crystal; refresh(); })
+                      .bounds(x, y, w, h).build());
+                  bAnchor = addRenderableWidget(Button.builder(Component.empty(), b -> { Cfg.anchor = !Cfg.anchor; refresh(); })
+                      .bounds(x, y + gap, w, h).build());
+
+                  bDelay = row(x, y + gap * 2, w, h, () -> { Cfg.delay = Math.max(1, Cfg.delay - 1); }, () -> { Cfg.delay = Math.min(20, Cfg.delay + 1); });
+                  bMin = row(x, y + gap * 3, w, h, () -> { Cfg.minDamage = Math.max(0, Cfg.minDamage - 1); }, () -> { Cfg.minDamage = Math.min(40, Cfg.minDamage + 1); });
+                  bMax = row(x, y + gap * 4, w, h, () -> { Cfg.maxSelf = Math.max(0, Cfg.maxSelf - 1); }, () -> { Cfg.maxSelf = Math.min(40, Cfg.maxSelf + 1); });
+                  bRange = row(x, y + gap * 5, w, h, () -> { Cfg.targetRange = Math.max(2, Cfg.targetRange - 1); }, () -> { Cfg.targetRange = Math.min(12, Cfg.targetRange + 1); });
+
+                  addRenderableWidget(Button.builder(Component.literal("Turn all OFF"), b -> { Cfg.crystal = false; Cfg.anchor = false; refresh(); })
+                      .bounds(x, y + gap * 6, w, h).build());
+                  addRenderableWidget(Button.builder(Component.literal("Done"), b -> onClose())
+                      .bounds(x, y + gap * 7, w, h).build());
+                  refresh();
+              }
+
+              /** A label (disabled button used as text) flanked by [-] and [+]. Returns the label button. */
+              private Button row(int x, int y, int w, int h, Runnable minus, Runnable plus) {
+                  addRenderableWidget(Button.builder(Component.literal("-"), b -> { minus.run(); refresh(); }).bounds(x, y, 30, h).build());
+                  addRenderableWidget(Button.builder(Component.literal("+"), b -> { plus.run(); refresh(); }).bounds(x + w - 30, y, 30, h).build());
+                  Button label = Button.builder(Component.empty(), b -> {}).bounds(x + 32, y, w - 64, h).build();
+                  label.active = false;
+                  return addRenderableWidget(label);
+              }
+
+              private void refresh() {
+                  bCrystal.setMessage(Component.literal("Auto Crystal: " + (Cfg.crystal ? "ON" : "OFF")));
+                  bAnchor.setMessage(Component.literal("Auto Anchor: " + (Cfg.anchor ? "ON" : "OFF")));
+                  bDelay.setMessage(Component.literal("Delay: " + Cfg.delay + " tick"));
+                  bMin.setMessage(Component.literal("Min dmg: " + (int) Cfg.minDamage));
+                  bMax.setMessage(Component.literal("Max self: " + (int) Cfg.maxSelf));
+                  bRange.setMessage(Component.literal("Range: " + (int) Cfg.targetRange));
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
+                  super.render(g, mouseX, mouseY, delta);
+                  g.drawCenteredString(this.font, this.title, this.width / 2, this.height / 2 - 100 - 16, 0xFFFFFFFF);
+              }
+
+              @Override public boolean isPauseScreen() { return false; }
+          }
+          PVPEOF
+          mkdir -p src/main/java/dev/pvpbot
+          cat > src/main/java/dev/pvpbot/Util.java <<'PVPEOF'
+          package dev.pvpbot;
+
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.client.player.LocalPlayer;
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.world.InteractionHand;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.phys.BlockHitResult;
+          import net.minecraft.world.phys.Vec3;
+
+          public final class Util {
+              private Util() {}
+
+              public static Player nearestTarget(Minecraft mc, double range) {
+                  LocalPlayer me = mc.player;
+                  ClientLevel level = mc.level;
+                  Player best = null;
+                  double bd = range * range;
+                  for (Player p : level.players()) {
+                      if (p == me || !p.isAlive() || p.isSpectator()) continue;
+                      double d = p.distanceToSqr(me);
+                      if (d < bd) { bd = d; best = p; }
+                  }
+                  return best;
+              }
+
+              /** Hotbar slot holding the item, or -1. */
+              public static int findHotbar(LocalPlayer p, Item item) {
+                  for (int i = 0; i < 9; i++) if (p.getInventory().getItem(i).is(item)) return i;
+                  return -1;
+              }
+
+              /** Hotbar slot with anything that is NOT the given item (prefers the current slot), or -1. */
+              public static int findHotbarNot(LocalPlayer p, Item item) {
+                  int cur = p.getInventory().getSelectedSlot();
+                  if (!p.getInventory().getItem(cur).is(item)) return cur;
+                  for (int i = 0; i < 9; i++) if (!p.getInventory().getItem(i).is(item)) return i;
+                  return -1;
+              }
+
+              public static void select(LocalPlayer p, int slot) {
+                  if (slot >= 0 && slot < 9 && p.getInventory().getSelectedSlot() != slot) {
+                      p.getInventory().setSelectedSlot(slot);
+                  }
+              }
+
+              /** Right-click the given face of a block with the held item. */
+              public static void useOn(Minecraft mc, BlockPos pos, Direction face) {
+                  Vec3 hit = Vec3.atCenterOf(pos).add(face.getStepX() * 0.5, face.getStepY() * 0.5, face.getStepZ() * 0.5);
+                  BlockHitResult r = new BlockHitResult(hit, face, pos, false);
+                  mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, r);
+                  mc.player.swing(InteractionHand.MAIN_HAND);
+              }
+
+              public static boolean inReach(LocalPlayer p, BlockPos pos, double range) {
+                  return p.getEyePosition().distanceToSqr(Vec3.atCenterOf(pos)) <= range * range;
+              }
+          }
+          PVPEOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'PVPEOF'
+          {
+            "schemaVersion": 1,
+            "id": "pvpbot",
+            "version": "${version}",
+            "name": "PvP Bot",
+            "description": "Client-side auto crystal and auto anchor helper, controlled with /pvpbot commands.",
+            "authors": ["you"],
+            "environment": "client",
+            "entrypoints": { "client": ["dev.pvpbot.PvpBotClient"] },
+            "depends": {
+              "fabricloader": ">=0.17.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          PVPEOF
+      - name: Build
+        run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pvpbot-jar
+          path: build/libs/pvpbot-1.0.0.jar
